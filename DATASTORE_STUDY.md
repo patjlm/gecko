@@ -859,21 +859,6 @@ CREATE NULL_FILTERED INDEX idx_resources_active
     WHERE DeletionTimestamp IS NULL;
 
 -- ============================================================
--- Event log for watch replay (automatic 7-day TTL)
--- ============================================================
-CREATE TABLE EventLog (
-    ResourceType       STRING(253)   NOT NULL,
-    ResourceVersion    INT64         NOT NULL,
-    EventType          STRING(16)    NOT NULL,
-    Namespace          STRING(253)   NOT NULL,
-    Name               STRING(253)   NOT NULL,
-    ContextFilter      STRING(253)   NOT NULL,
-    Data               JSON          NOT NULL,
-    CreatedAt          TIMESTAMP     NOT NULL OPTIONS (allow_commit_timestamp = true),
-) PRIMARY KEY (ResourceType, ResourceVersion),
-  ROW DELETION POLICY (OLDER_THAN(CreatedAt, INTERVAL 7 DAY));
-
--- ============================================================
 -- Counter table for monotonic resource versions
 -- ============================================================
 CREATE TABLE Counters (
@@ -882,12 +867,14 @@ CREATE TABLE Counters (
 ) PRIMARY KEY (CounterID);
 
 -- ============================================================
--- Compaction horizon
+-- Change Stream cursor persistence for watch resume
 -- ============================================================
-CREATE TABLE CompactionHorizon (
-    ResourceType       STRING(253)   NOT NULL,
-    CompactedRV        INT64         NOT NULL,
-) PRIMARY KEY (ResourceType);
+CREATE TABLE ChangeStreamCursors (
+    ReplicaID          STRING(128)   NOT NULL,
+    PartitionToken     STRING(MAX)   NOT NULL,
+    ResumeTimestamp    TIMESTAMP     NOT NULL,
+    UpdatedAt          TIMESTAMP     NOT NULL OPTIONS (allow_commit_timestamp = true),
+) PRIMARY KEY (ReplicaID, PartitionToken);
 
 -- ============================================================
 -- Change Stream for watch (one stream covers all resource types)
@@ -912,6 +899,12 @@ CREATE CHANGE STREAM ResourceChanges
 **Covering index (`STORING` clause):** The `idx_resources_rv` index stores `Data`, `Labels`, `ContextFilter`, `Namespace`, and `Name` alongside the indexed columns. This enables index-only reads for List-by-RV queries — Spanner serves the query entirely from the index without a table lookup. spanner-etcd measured **+40% read improvement** with this pattern. Trade-off: higher write amplification (data stored in both table and index).
 
 **Change Stream:** A single `ResourceChanges` stream covers all resource types. Multiple API replicas share it as concurrent readers (up to 20 per partition). Spanner's hard limit of 10 Change Streams per database means this design leaves 9 streams available for other uses (auditing, analytics, replication). See [§9.2](#92-watch--change-notification) for watch implementation.
+
+**No EventLog table:** With Change Streams, a separate event log table is unnecessary. Change Streams provide both live watch delivery and historical replay (7-day retention, cursor-based resume). This eliminates write amplification — mutations write to `Resources` only, not to both `Resources` and an event log. The `ChangeStreamCursors` table persists partition cursors for watch resume after pod restart (pattern from spanner-etcd).
+
+**No CompactionHorizon table:** Without an event log, there is nothing to compact. Change Streams manage their own retention automatically.
+
+> **Emulator limitation:** The [Spanner emulator does not support Change Streams](https://cloud.google.com/spanner/docs/emulator#limitations). For local dev and CI, the `ResourceStore` implementation should fall back to an `EventLog` table + polling. This is handled at the implementation level — the schema above is for production Spanner only. The PostgreSQL backend (used for local dev) already has its own event log + LISTEN/NOTIFY mechanism.
 
 **Resource version strategy for Spanner:** Two options:
 
@@ -1009,16 +1002,7 @@ Watcher goroutine:
 
 Change Streams are **source-side definitions** — one stream watches one or more tables, and multiple consumers (API replicas) share it as concurrent readers. This is essential for multi-replica deployments: an in-process broadcaster cannot propagate writes from replica A to watchers on replica B. Change Streams provide a shared event source that all replicas read from independently.
 
-**Cursor persistence (from spanner-etcd):** spanner-etcd persists Change Stream partition cursors to a dedicated table (`kv_cs_cursors`) every 5 seconds. On pod restart, the watcher resumes from the last persisted cursor instead of replaying the full event log. This pattern should be adopted:
-
-```sql
-CREATE TABLE ChangeStreamCursors (
-    ReplicaID        STRING(128)   NOT NULL,
-    PartitionToken   STRING(MAX)   NOT NULL,
-    ResumeTimestamp  TIMESTAMP     NOT NULL,
-    UpdatedAt        TIMESTAMP     NOT NULL OPTIONS (allow_commit_timestamp = true),
-) PRIMARY KEY (ReplicaID, PartitionToken);
-```
+**Cursor persistence (from spanner-etcd):** spanner-etcd persists Change Stream partition cursors to a dedicated table (`kv_cs_cursors`) every 5 seconds. On pod restart, the watcher resumes from the last persisted cursor instead of replaying the full event log. This pattern is adopted in the schema (see `ChangeStreamCursors` in [§8.2](#82-spanner-schema)).
 
 ### 9.3 Optimistic Concurrency Control
 
