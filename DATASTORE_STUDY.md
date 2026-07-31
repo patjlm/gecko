@@ -13,7 +13,8 @@
 - [5. Prior Art](#5-prior-art)
   - [5.1 Kine (k3s)](#51-kine-k3s)
   - [5.2 postgres-controller-backend](#52-postgres-controller-backend)
-  - [5.3 sample-apiserver and apiserver-builder-alpha](#53-sample-apiserver-and-apiserver-builder-alpha)
+  - [5.3 spanner-etcd (GKE)](#53-spanner-etcd-gke)
+  - [5.4 sample-apiserver and apiserver-builder-alpha](#54-sample-apiserver-and-apiserver-builder-alpha)
 - [6. GCP Datastore Alternatives](#6-gcp-datastore-alternatives)
   - [6.1 Option A: Cloud Spanner (Recommended)](#61-option-a-cloud-spanner-recommended)
   - [6.2 Option B: Cloud SQL for PostgreSQL](#62-option-b-cloud-sql-for-postgresql)
@@ -270,7 +271,75 @@ The `o<version>;` prefix carries the per-object version so objects from the info
 
 **Lesson for Gecko:** The dual-versioning approach (transaction ID for ordering + per-object version for OCC) is elegant and eliminates the single-counter bottleneck that plagues both kine and the Firestore/Bigtable PoCs. This pattern should be adapted for our chosen datastore.
 
-### 5.3 sample-apiserver and apiserver-builder-alpha
+### 5.3 spanner-etcd (GKE)
+
+[spanner-etcd](https://github.com/n0rm4l-me/spanner-etcd) is an open-source drop-in etcd v3 replacement built on Cloud Spanner. Google internally uses Spanner as the backing store for GKE clusters [scaling to 65,000+ nodes](https://cloud.google.com/blog/products/containers-kubernetes/gke-65k-nodes-and-counting).
+
+**Schema (true KV table):**
+
+```sql
+CREATE SEQUENCE IF NOT EXISTS kv_seq OPTIONS (
+  sequence_kind = 'bit_reversed_positive'
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+  id               INT64 NOT NULL DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE kv_seq)),
+  rev              TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
+  key              STRING(2048) NOT NULL,
+  value            BYTES(MAX),
+  old_value        BYTES(MAX),
+  lease_id         INT64,
+  deleted          BOOL NOT NULL DEFAULT (false),
+  created          BOOL NOT NULL DEFAULT (false),
+  create_revision  TIMESTAMP OPTIONS (allow_commit_timestamp = true),
+  prev_revision    TIMESTAMP OPTIONS (allow_commit_timestamp = true)
+) PRIMARY KEY (id);
+
+-- Covering index for fast key lookups (+40% read improvement)
+CREATE INDEX IF NOT EXISTS kv_key_rev ON kv (key, rev DESC)
+  STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision);
+
+CREATE INDEX IF NOT EXISTS kv_rev_desc ON kv (rev DESC);
+CREATE INDEX IF NOT EXISTS kv_lease_idx ON kv (lease_id) STORING (key, rev);
+
+-- Watch via Change Streams
+CREATE CHANGE STREAM IF NOT EXISTS kv_changes
+  FOR kv
+  OPTIONS (retention_period = '7d', value_capture_type = 'NEW_ROW');
+```
+
+Auxiliary tables: `kv_rev` (compaction horizon), `kv_lease` (lease management), `kv_cs_cursors` (Change Stream cursor persistence for watch resume across restarts).
+
+**Key design decisions:**
+
+| Decision | Rationale | Performance Impact |
+|----------|-----------|-------------------|
+| **`PENDING_COMMIT_TIMESTAMP()` as revision** | Eliminates counter row — each transaction gets a unique, monotonic timestamp via TrueTime without coordination | **15× write throughput** vs counter-based approach at 32× concurrency |
+| **Bit-reversed sequence for PK** | Distributes writes across Spanner splits — avoids hotspotting on monotonic auto-increment | Even write distribution under high concurrency |
+| **Covering index with STORING** | Index-only reads — no table lookup for common Get queries | **+40% read improvement**, +167% mixed workload |
+| **Append-only log model** | Matches etcd's MVCC semantics — every write appends a new row, old rows cleaned by compaction | Preserves etcd wire compatibility at the cost of compaction complexity |
+| **Change Streams for watch** | Push-based delivery from Spanner's CDC; cursor persisted to DB every 5s for crash recovery | ~30ms watch latency (vs etcd's ~1ms) |
+| **BYTES for values** | No re-serialization — stores protobuf directly | Zero encoding overhead |
+
+**Strengths:**
+- Proven at massive scale (GKE 65K nodes)
+- Stateless replicas — all state in Spanner, horizontal scaling by adding pods
+- No Raft consensus needed — eliminates server-to-server coordination
+- Fully managed operational model (99.999% SLA)
+
+**Weaknesses:**
+- Designed for etcd API wire compatibility — carries etcd baggage (append-only log, compaction, tombstones, old_value)
+- Higher watch latency (~30ms vs etcd's ~1ms)
+- Complex transaction mapping — `PENDING_COMMIT_TIMESTAMP()` makes tables unreadable after first write in a transaction
+
+**Lesson for Gecko:** spanner-etcd targets a different problem (etcd API compatibility), so its append-only log model and `old_value` storage are unnecessary for Gecko's `rest.Storage` approach. However, its Spanner-specific optimizations are directly applicable:
+
+- **Commit timestamps for RV** — eliminates counter bottleneck
+- **Covering indexes** — significant read performance gains
+- **Change Streams with cursor persistence** — reliable watch across pod restarts
+- **Bit-reversed sequences** — write distribution across splits
+
+### 5.4 sample-apiserver and apiserver-builder-alpha
 
 **[sample-apiserver](https://github.com/kubernetes/sample-apiserver)** is the official reference implementation for aggregated API servers. It demonstrates the standard `genericregistry.Store` + etcd pattern:
 
@@ -726,45 +795,80 @@ $$;
 
 ### 8.2 Spanner Schema
 
+#### Schema Topology: Single Table vs Per-Type Tables
+
+The schema uses a **single `Resources` table** with `ResourceType` in the primary key, rather than per-type tables (`resources_{type}`, `event_log_{type}`).
+
+**Why single table:**
+
+| Factor | Single Table | Per-Type Tables |
+|--------|-------------|-----------------|
+| **Change Streams** | One stream covers everything. Spanner has a **hard limit of 10 Change Streams per database**. Per-type tables burn 1-2 streams per type — 5 resource types can hit the ceiling. | Each type needs its own stream or must use `FOR ALL` (includes internal tables). |
+| **DDL lifecycle** | Zero schema changes for new resource types — just new rows. | `CREATE TABLE` + indexes per new type. Online but takes seconds-to-minutes. |
+| **Split distribution** | Spanner auto-splits by PK prefix. `ResourceType` as leading key means each type gets its own splits at scale — physically equivalent to per-type tables. | Independent splits per table. Same distribution. |
+| **Query performance** | `WHERE ResourceType = ?` uses index seek (PK prefix). No scan. Equivalent to querying a dedicated table. | Direct table access, no type filter needed. |
+| **Monitoring** | Aggregate metrics. Filter by `ResourceType` in queries. | Native per-type metrics. |
+| **FGAC** | Via views (one view per type). | Native table-level grants. |
+| **TTL** | One policy per table — fine since all resource types share the same retention. | Can set different TTLs per type (rarely needed). |
+
+Per-type tables win on monitoring and FGAC simplicity but lose on the Change Stream limit — which is the critical constraint for multi-replica watch. With Gecko's fixed set of resource types (defined in-repo), per-type DDL is manageable, but the 10-stream limit is a hard ceiling that single-table avoids entirely.
+
+**Differences from spanner-etcd's KV schema:**
+
+spanner-etcd uses a flat `kv` table with `key STRING` and `value BYTES` — optimized for etcd API wire compatibility (append-only log, MVCC, tombstones, compaction). Gecko implements `rest.Storage` directly, enabling:
+
+- **Structured PK** (`ResourceType`, `Namespace`, `Name`) — index seeks instead of `LIKE` prefix matching
+- **Update-in-place** — no append-only log, no compaction, no `old_value` column
+- **Separate EventLog table** — independent TTL, cleaner watch replay
+- **JSON `Data` column** — enables future server-side field querying
+- **Dual versioning** — `ResourceVersion` for event ordering, `ObjectVersion` for OCC (spanner-etcd uses commit timestamps for both)
+
+#### Schema Definition
+
 ```sql
 -- ============================================================
--- Resource table
+-- Resource table: single table for all resource types
 -- ============================================================
 CREATE TABLE Resources (
-    ResourceType       STRING(256)   NOT NULL,
-    Namespace          STRING(256)   NOT NULL,
-    Name               STRING(256)   NOT NULL,
+    ResourceType       STRING(253)   NOT NULL,
+    Namespace          STRING(253)   NOT NULL,
+    Name               STRING(253)   NOT NULL,
+    ContextFilter      STRING(253)   NOT NULL,
     UID                STRING(36)    NOT NULL,
     ResourceVersion    INT64         NOT NULL,
     ObjectVersion      INT64         NOT NULL,
     Data               JSON          NOT NULL,
     Labels             JSON,
     DeletionTimestamp   TIMESTAMP,
-    ContextFilter      STRING(256)   NOT NULL,
     CreatedAt          TIMESTAMP     NOT NULL OPTIONS (allow_commit_timestamp = true),
     UpdatedAt          TIMESTAMP     NOT NULL OPTIONS (allow_commit_timestamp = true),
-) PRIMARY KEY (ResourceType, Namespace, Name, ContextFilter);
+) PRIMARY KEY (ResourceType, ContextFilter, Namespace, Name);
 
--- Secondary index for watch queries
-CREATE INDEX ResourcesByRV
-    ON Resources (ResourceType, ResourceVersion);
+-- Server-side UID uniqueness enforcement
+CREATE UNIQUE INDEX idx_resources_uid
+    ON Resources (UID);
 
--- Secondary index for listing live objects
-CREATE NULL_FILTERED INDEX ResourcesByNamespace
+-- Covering index for List-by-RV queries (index-only reads)
+CREATE INDEX idx_resources_rv
+    ON Resources (ResourceType, ResourceVersion)
+    STORING (Data, Labels, ContextFilter, Namespace, Name);
+
+-- Efficient filtering of non-deleted resources
+CREATE NULL_FILTERED INDEX idx_resources_active
     ON Resources (ResourceType, Namespace)
     WHERE DeletionTimestamp IS NULL;
 
 -- ============================================================
--- Event log for watch replay
+-- Event log for watch replay (automatic 7-day TTL)
 -- ============================================================
 CREATE TABLE EventLog (
-    ResourceType       STRING(256)   NOT NULL,
+    ResourceType       STRING(253)   NOT NULL,
     ResourceVersion    INT64         NOT NULL,
     EventType          STRING(16)    NOT NULL,
-    Namespace          STRING(256)   NOT NULL,
-    Name               STRING(256)   NOT NULL,
+    Namespace          STRING(253)   NOT NULL,
+    Name               STRING(253)   NOT NULL,
+    ContextFilter      STRING(253)   NOT NULL,
     Data               JSON          NOT NULL,
-    ContextFilter      STRING(256)   NOT NULL,
     CreatedAt          TIMESTAMP     NOT NULL OPTIONS (allow_commit_timestamp = true),
 ) PRIMARY KEY (ResourceType, ResourceVersion),
   ROW DELETION POLICY (OLDER_THAN(CreatedAt, INTERVAL 7 DAY));
@@ -773,7 +877,7 @@ CREATE TABLE EventLog (
 -- Counter table for monotonic resource versions
 -- ============================================================
 CREATE TABLE Counters (
-    CounterID          STRING(256)   NOT NULL,
+    CounterID          STRING(253)   NOT NULL,
     Value              INT64         NOT NULL,
 ) PRIMARY KEY (CounterID);
 
@@ -781,10 +885,33 @@ CREATE TABLE Counters (
 -- Compaction horizon
 -- ============================================================
 CREATE TABLE CompactionHorizon (
-    ResourceType       STRING(256)   NOT NULL,
+    ResourceType       STRING(253)   NOT NULL,
     CompactedRV        INT64         NOT NULL,
 ) PRIMARY KEY (ResourceType);
+
+-- ============================================================
+-- Change Stream for watch (one stream covers all resource types)
+-- ============================================================
+CREATE CHANGE STREAM ResourceChanges
+    FOR Resources
+    OPTIONS (retention_period = '7d', value_capture_type = 'NEW_VALUES');
 ```
+
+**Primary key ordering rationale:** `(ResourceType, ContextFilter, Namespace, Name)` groups data by type first (each type gets its own Spanner splits at scale), then by tenant (`ContextFilter`), then by namespace and name. This ensures type-scoped queries and tenant-scoped queries both use PK prefix seeks.
+
+**Column design notes:**
+
+| Column | Purpose |
+|--------|---------|
+| `UID STRING(36)` | Server-side uniqueness via unique index. Distinguishes resource incarnations (delete + recreate with same name). Required for Kubernetes ownerReferences and garbage collection. |
+| `ObjectVersion INT64` | Per-object OCC counter, incremented on each mutation. Decoupled from global `ResourceVersion` — concurrent updates to different objects don't contend. See [§9.3](#93-optimistic-concurrency-control). |
+| `DeletionTimestamp TIMESTAMP` | Enables `NULL_FILTERED` index for efficient DB-level filtering of active resources, avoiding JSON blob deserialization. |
+| `Labels JSON` | Stored as a separate column for potential server-side label filtering via Spanner Search Indexes or generated columns. |
+| `STRING(253)` | Matches RFC 1123 DNS name maximum length. |
+
+**Covering index (`STORING` clause):** The `idx_resources_rv` index stores `Data`, `Labels`, `ContextFilter`, `Namespace`, and `Name` alongside the indexed columns. This enables index-only reads for List-by-RV queries — Spanner serves the query entirely from the index without a table lookup. spanner-etcd measured **+40% read improvement** with this pattern. Trade-off: higher write amplification (data stored in both table and index).
+
+**Change Stream:** A single `ResourceChanges` stream covers all resource types. Multiple API replicas share it as concurrent readers (up to 20 per partition). Spanner's hard limit of 10 Change Streams per database means this design leaves 9 streams available for other uses (auditing, analytics, replication). See [§9.2](#92-watch--change-notification) for watch implementation.
 
 **Resource version strategy for Spanner:** Two options:
 
@@ -817,15 +944,7 @@ mutation := spanner.InsertOrUpdate("Resources",
 
 This eliminates the counter document entirely but requires converting timestamps to int64 resource versions (microseconds since epoch). The trade-off is that RVs are no longer sequential integers but are still monotonically increasing.
 
-**Watch mechanism for Spanner:** [Change Streams](https://cloud.google.com/spanner/docs/change-streams) provide real-time CDC:
-
-```sql
-CREATE CHANGE STREAM ResourceChanges
-    FOR Resources
-    OPTIONS (retention_period = '7d', value_capture_type = 'NEW_VALUES');
-```
-
-Each API server replica reads the change stream independently. Cursor position persisted to Spanner for resume across failover. Measured latency: ~30ms same-region.
+**Watch mechanism for Spanner:** Change Streams provide real-time CDC. The `ResourceChanges` stream is defined in the schema (see [§8.2](#82-spanner-schema)). Each API server replica reads the stream independently as a concurrent reader. Cursor position persisted to Spanner for resume across failover. See [§9.2](#92-watch--change-notification) for details on limits, multi-replica considerations, and cursor persistence.
 
 ---
 
@@ -837,10 +956,10 @@ Each API server replica reads the change stream independently. Cursor position p
 |-----------|----------|------|------|
 | **PostgreSQL** | `pg_current_xact_id()` | No shared counter, no write serialization, globally monotonic | PostgreSQL-specific; xid wraparound (extremely rare with 64-bit xid8) |
 | **Spanner** (counter) | Read-increment-write in transaction | Simple, sequential integers | Counter row contention under concurrent writes |
-| **Spanner** (commit TS) | `PENDING_COMMIT_TIMESTAMP()` | No counter bottleneck, Spanner guarantees monotonicity | Not sequential integers; requires timestamp→int64 mapping |
+| **Spanner** (commit TS) | `PENDING_COMMIT_TIMESTAMP()` | No counter bottleneck, Spanner guarantees monotonicity; **15× write throughput** vs counter (spanner-etcd benchmark at 32× concurrency) | Not sequential integers; requires timestamp→int64 mapping; table becomes unreadable after first write in same transaction |
 | **Kine** | `BIGSERIAL` | Simple, sequential | Requires gap-free sequence; limits HA options |
 
-**Recommendation:** For PostgreSQL, use `pg_current_xact_id()` (proven by postgres-controller-backend). For Spanner, start with counter-based (simpler) and migrate to commit-timestamp if counter becomes a bottleneck.
+**Recommendation:** For PostgreSQL, use `pg_current_xact_id()` (proven by postgres-controller-backend). For Spanner, start with counter-based (simpler) and migrate to commit-timestamp if counter becomes a bottleneck under multi-replica concurrent writes. The migration path is straightforward — counter and commit-timestamp RVs are both monotonic INT64 values, so the `ResourceStore` interface doesn't change.
 
 ### 9.2 Watch / Change Notification
 
@@ -876,7 +995,29 @@ Watcher goroutine:
      a. Parse data change
      b. Reconstruct resource object
      c. Fan out to subscribers
-  3. Periodically persist cursor position
+  3. Periodically persist cursor position to DB (every ~5s)
+```
+
+**Change Streams: limits and multi-replica considerations:**
+
+| Constraint | Value | Impact |
+|------------|-------|--------|
+| **Max streams per database** | **10** (hard limit) | Schema topology choice — single-table uses 1 stream; per-type tables burn 1-2 per type |
+| **Max concurrent readers per partition** | 20 (recommend ≤5) | All API replicas share the same stream as concurrent readers — not a problem for typical deployments |
+| **Retention period** | 1-30 days (default 7d) | Must exceed maximum expected downtime for watch resume |
+| **Latency** | ~30ms same-region | Higher than etcd (~1ms) but acceptable for Kubernetes watch semantics |
+
+Change Streams are **source-side definitions** — one stream watches one or more tables, and multiple consumers (API replicas) share it as concurrent readers. This is essential for multi-replica deployments: an in-process broadcaster cannot propagate writes from replica A to watchers on replica B. Change Streams provide a shared event source that all replicas read from independently.
+
+**Cursor persistence (from spanner-etcd):** spanner-etcd persists Change Stream partition cursors to a dedicated table (`kv_cs_cursors`) every 5 seconds. On pod restart, the watcher resumes from the last persisted cursor instead of replaying the full event log. This pattern should be adopted:
+
+```sql
+CREATE TABLE ChangeStreamCursors (
+    ReplicaID        STRING(128)   NOT NULL,
+    PartitionToken   STRING(MAX)   NOT NULL,
+    ResumeTimestamp  TIMESTAMP     NOT NULL,
+    UpdatedAt        TIMESTAMP     NOT NULL OPTIONS (allow_commit_timestamp = true),
+) PRIMARY KEY (ReplicaID, PartitionToken);
 ```
 
 ### 9.3 Optimistic Concurrency Control
@@ -942,11 +1083,15 @@ With multiple API server replicas writing concurrently:
 
 | Concern | PostgreSQL Solution | Spanner Solution |
 |---------|-------------------|-----------------|
-| **Concurrent creates** | UNIQUE constraint → `AlreadyExists` | Primary key constraint → `AlreadyExists` |
-| **Concurrent updates** | `object_version` WHERE clause → Conflict | Read-write transaction + version check → Conflict |
-| **Event ordering** | `pg_current_xact_id()` globally monotonic per PostgreSQL instance | Commit timestamps monotonic per Spanner |
-| **Watch consistency** | `pg_snapshot_xmin()` ensures no in-flight txns below watermark | Change Stream guarantees linearizable delivery |
+| **Concurrent creates** | UNIQUE constraint → `AlreadyExists` | Primary key constraint + UID unique index → `AlreadyExists` |
+| **Concurrent updates** | `object_version` WHERE clause → Conflict | Read-write transaction + `ObjectVersion` check → Conflict |
+| **Event ordering** | `pg_current_xact_id()` globally monotonic per PostgreSQL instance | Commit timestamps monotonic per Spanner (TrueTime) |
+| **Watch consistency** | `pg_snapshot_xmin()` ensures no in-flight txns below watermark | Change Streams guarantee linearizable delivery across all replicas |
+| **Watch cross-replica** | LISTEN/NOTIFY broadcasts to all connected clients | Change Streams — all replicas read from same shared stream |
 | **List consistency** | `REPEATABLE READ` snapshot isolation | Spanner strong reads (default) |
+| **Counter contention** | None — `pg_current_xact_id()` is per-transaction, no shared state | Counter row serializes all replicas. Migrate to `PENDING_COMMIT_TIMESTAMP()` if bottleneck. |
+
+**Critical multi-replica requirement:** The watch mechanism must propagate writes from any replica to watchers on all replicas. An in-process broadcaster (writing replica fans out to its own subscribers only) breaks watch semantics in multi-replica deployments. Both PostgreSQL (LISTEN/NOTIFY) and Spanner (Change Streams) provide database-level event propagation that satisfies this requirement.
 
 ---
 
@@ -1131,6 +1276,9 @@ Spanner offers a [PostgreSQL-compatible interface](https://cloud.google.com/span
 - [kubernetes/sample-apiserver](https://github.com/kubernetes/sample-apiserver) — Official reference aggregated API server
 - [kubernetes-sigs/apiserver-builder-alpha](https://github.com/kubernetes-sigs/apiserver-builder-alpha) — Code generation framework for aggregated API servers
 - [k3s-io/kine](https://github.com/k3s-io/kine) — etcd shim for SQL backends (PostgreSQL, MySQL, SQLite, NATS)
+- [n0rm4l-me/spanner-etcd](https://github.com/n0rm4l-me/spanner-etcd) — Drop-in etcd v3 replacement using Cloud Spanner (schema, architecture, benchmarks)
+- [spanner-etcd architecture doc](https://github.com/n0rm4l-me/spanner-etcd/blob/main/docs/architecture.md) — Design decisions, Kine comparison, transaction mapping
+- [spanner-etcd DDL schema](https://github.com/n0rm4l-me/spanner-etcd/blob/main/ddl/schema.sql) — KV table, indexes, Change Stream definition
 - [Goodbye etcd, Hello PostgreSQL — Martin Heinz](https://martinheinz.dev/blog/100)
 - [Exploring Kine — 01Cloud](https://engineering.01cloud.com/2026/02/03/exploring-kine-the-etcd-shim-revolutionizing-kubernetes-storage/)
 - [k3s Cluster Datastore Documentation](https://docs.k3s.io/datastore)
@@ -1150,6 +1298,10 @@ Spanner offers a [PostgreSQL-compatible interface](https://cloud.google.com/span
 - [Spanner TrueTime and External Consistency](https://cloud.google.com/spanner/docs/true-time-external-consistency)
 - [Spanner Point-in-Time Recovery](https://cloud.google.com/spanner/docs/pitr)
 - [Spanner Managed Autoscaler](https://cloud.google.com/spanner/docs/managed-autoscaler)
+- [Spanner Quotas and Limits](https://cloud.google.com/spanner/quotas) — 10 Change Streams per database, schema object limits
+- [Spanner Multi-Tenancy Patterns](https://cloud.google.com/spanner/docs/implement-multi-tenancy) — Row data management vs table data management
+- [Spanner Schema Design Best Practices](https://cloud.google.com/spanner/docs/schema-design) — PK design, hotspot avoidance, split behavior
+- [Spanner Commit Timestamps](https://cloud.google.com/spanner/docs/commit-timestamp) — `PENDING_COMMIT_TIMESTAMP()` guarantees
 - [spanner-etcd: Drop-in etcd replacement using Cloud Spanner](https://github.com/n0rm4l-me/spanner-etcd)
 - [GKE supports 65,000-node clusters (Spanner-based storage)](https://cloud.google.com/blog/products/containers-kubernetes/gke-65k-nodes-and-counting)
 - [How we built a 130,000-node GKE cluster](https://cloud.google.com/blog/products/containers-kubernetes/how-we-built-a-130000-node-gke-cluster/)
@@ -1195,6 +1347,7 @@ Spanner offers a [PostgreSQL-compatible interface](https://cloud.google.com/span
 
 - [PR #16: Bigtable storage backend](https://github.com/openshift-online/gecko/pull/16)
 - [PR #17: Firestore storage backend](https://github.com/openshift-online/gecko/pull/17)
+- [PR #21: Spanner storage backend](https://github.com/openshift-online/gecko/pull/21)
 
 ### Kine Known Issues
 
