@@ -1016,15 +1016,13 @@ Firestore is built on Spanner internally, so these guarantees *likely* hold — 
 | Gap | Impact |
 |-----|--------|
 | **No optimistic concurrency on Update** | Same as Bigtable PoC — last-write-wins semantics, violates Kubernetes API conventions. |
-| **`storage.EventPruner` interface does not exist** | PR won't compile — references undefined interface. |
-| **`opts.FieldFilters` does not exist on ListOptions** | Another compile error — field not defined on current branch. |
 | **TOCTOU race in Update/Delete** | `Get()` then `Set()` not atomic. Should use Firestore transactions. |
 | **Broadcast silently swallows errors** | Event log write failure is ignored; watchers miss events with no error surfaced. |
 | **Document ID collision risk** | `_` separator means `ns_a` + name `b` collides with `ns` + name `a_b`. |
 
 **Cost:** $0-1/month (free tier covers small deployments) — most cost-effective option by far.
 
-**Verdict:** Firestore's document model and real-time listeners are appealing, but the 1 write/sec/document counter bottleneck is a fundamental limitation. The PoC has multiple compile errors and missing OCC. Could work for very low-write-volume use cases but does not meet production requirements.
+**Verdict:** Firestore's document model and real-time listeners are appealing, but the 1 write/sec/document counter bottleneck is a fundamental limitation. The PoC is missing OCC on updates. Could work for very low-write-volume use cases but the counter bottleneck needs to be addressed (see timestamp-as-RV analysis above).
 
 ---
 
@@ -1058,11 +1056,59 @@ Gecko already has a working PostgreSQL store implementation. The postgres-contro
 | **AlloyDB** (2 vCPU HA) | ~$200-300 | ~$144-216 (52% off) | 99.99% |
 | **Cloud SQL** (2 vCPU HA) | ~$80-120 | N/A (shared CPU only) | 99.95% |
 
+### Pluggable ResourceStore: Dev/Stage/Prod Strategy
+
+Gecko's `ResourceStore` interface already provides the abstraction needed to run different backends per environment. This avoids coupling to a single datastore while optimizing cost and operability per tier:
+
+| Environment | Backend | Estimated Cost | Rationale |
+|-------------|---------|---------------|-----------|
+| **Local dev** | PostgreSQL (Docker) | $0 | Fast iteration, no cloud dependency |
+| **Integration / CI** | Cloud SQL PostgreSQL (shared CPU) | ~$14/month | Cheapest cloud option, disposable |
+| **Stage** | Cloud Spanner (2 nodes) or Cloud SQL (HA) | $80-1,314/month | Match prod topology or use cheaper HA |
+| **Production** | Cloud Spanner (2 nodes) | ~$1,314/month | Zero-downtime, strongest consistency |
+
+Each backend implements `ResourceStore` with its own storage-native patterns:
+
+- **PostgreSQL:** `pg_current_xact_id()` for RV, LISTEN/NOTIFY + event log for watch, stored procedure for writes, GIN index for labels
+- **Spanner:** `PENDING_COMMIT_TIMESTAMP()` for RV, Change Streams for watch, read-write transactions for OCC, Search Indexes or generated columns for labels
+
+### Spanner PostgreSQL Interface: Compatibility Analysis
+
+Spanner offers a [PostgreSQL-compatible interface](https://cloud.google.com/spanner/docs/postgresql-interface) via PGAdapter (wire-protocol proxy). Standard PostgreSQL drivers (pgx, lib/pq) connect through it. However, this does **not** enable a single SQL codebase across Cloud SQL and Spanner.
+
+**What works well through Spanner's PG interface:**
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Basic CRUD (SELECT, INSERT, UPDATE, DELETE) | Works | Standard PostgreSQL syntax |
+| JSONB data type | Works | Storage and querying supported |
+| REPEATABLE READ isolation | Works | Snapshot isolation semantics |
+| ON CONFLICT (upsert) | Works | No WHERE clause support on the DO UPDATE |
+| Non-recursive CTEs | Works | WITH ... AS queries |
+| pgx driver (Go) | Works | v4.15+ via PGAdapter, ~0.2ms overhead |
+| Foreign keys, check constraints | Works | Always enforced |
+| `SPANNER.PENDING_COMMIT_TIMESTAMP()` | Works | Monotonic, unique per transaction (TrueTime) |
+| Change Streams | Works | Near real-time CDC with 7-day retention |
+
+**What does NOT work through Spanner's PG interface:**
+
+| Feature | Impact on Gecko | Alternative |
+|---------|----------------|-------------|
+| `pg_current_xact_id()` | Cannot use for resource versioning | Use `PENDING_COMMIT_TIMESTAMP()` or counter |
+| LISTEN/NOTIFY | Cannot use for watch notifications | Use Change Streams |
+| Stored procedures / PL/pgSQL | Cannot use `pgctl_write()` pattern | Move write logic to application layer |
+| GIN indexes on JSONB | Cannot index labels for server-side filtering | Use generated columns + secondary index, or Search Indexes (read-only txn only) |
+| Monotonic sequences (SERIAL) | Sequences are bit-reversed (non-monotonic) | Use `PENDING_COMMIT_TIMESTAMP()` or app-level counter |
+| Recursive CTEs | Minor — unlikely needed | Rewrite as iterative queries |
+| Triggers | Minor — not used in Gecko | N/A |
+
+**Conclusion:** Writing a Spanner backend using the PG interface is possible for basic CRUD but loses access to the key PostgreSQL-specific features Gecko relies on (txid, LISTEN/NOTIFY, stored procedures, GIN indexes). The recommended approach is to write the Spanner backend using **native GoogleSQL**, which provides the best access to Spanner-specific features (Change Streams, commit timestamps, interleaved tables). The `ResourceStore` interface isolates this from the rest of the codebase.
+
 ### Implementation Priority
 
-1. **Phase 1:** Implement Spanner `ResourceStore` backend with counter-based RV and Change Streams for watch.
-2. **Phase 2:** Harden PostgreSQL store with postgres-controller-backend patterns (stored procedure, OCC, compaction).
-3. **Phase 3:** Performance testing and migration tooling.
+1. **Phase 1:** Harden PostgreSQL store with postgres-controller-backend patterns (stored procedure, OCC, compaction). This gives immediate value for all environments.
+2. **Phase 2:** Implement Spanner `ResourceStore` backend using native GoogleSQL with commit-timestamp RV and Change Streams for watch.
+3. **Phase 3:** Performance testing, migration tooling, and environment-tier configuration.
 
 ---
 
@@ -1127,6 +1173,17 @@ Gecko already has a working PostgreSQL store implementation. The postgres-contro
 - [AlloyDBCluster CRD](https://docs.cloud.google.com/config-connector/docs/reference/resource-docs/alloydb/alloydbcluster)
 - [AlloyDBInstance CRD](https://docs.cloud.google.com/config-connector/docs/reference/resource-docs/alloydb/alloydbinstance)
 - [SQLInstance CRD](https://docs.cloud.google.com/config-connector/docs/reference/resource-docs/sql/sqlinstance)
+
+### Spanner PostgreSQL Interface
+
+- [PostgreSQL Interface Overview](https://cloud.google.com/spanner/docs/postgresql-interface)
+- [PGAdapter Overview](https://cloud.google.com/spanner/docs/pgadapter)
+- [Connect pgx to PostgreSQL-dialect Database](https://docs.cloud.google.com/spanner/docs/pg-pgx-connect)
+- [Supported PostgreSQL Functions](https://docs.cloud.google.com/spanner/docs/reference/postgresql/functions)
+- [PostgreSQL Data Types in Spanner](https://docs.cloud.google.com/spanner/docs/reference/postgresql/data-types)
+- [Commit Timestamps in PostgreSQL-dialect Databases](https://docs.cloud.google.com/spanner/docs/commit-timestamp-postgresql)
+- [Work with JSONB Data](https://docs.cloud.google.com/spanner/docs/working-with-jsonb)
+- [Create and Manage Sequences](https://docs.cloud.google.com/spanner/docs/sequence-tasks)
 
 ### PostgreSQL Specific
 
