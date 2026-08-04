@@ -314,8 +314,9 @@ Auxiliary tables: `kv_rev` (compaction horizon), `kv_lease` (lease management), 
 
 | Decision | Rationale | Performance Impact |
 |----------|-----------|-------------------|
-| **`PENDING_COMMIT_TIMESTAMP()` as revision** | Eliminates counter row — each transaction gets a unique, monotonic timestamp via TrueTime without coordination | **15× write throughput** vs counter-based approach at 32× concurrency |
-| **Bit-reversed sequence for PK** | Distributes writes across Spanner splits — avoids hotspotting on monotonic auto-increment | Even write distribution under high concurrency |
+| **`PENDING_COMMIT_TIMESTAMP()` as revision** | Eliminates counter row — each transaction gets a monotonic timestamp via TrueTime without coordination. Exposed to clients as `int64` via `time.UnixNano()`. | **15× write throughput** vs counter-based approach at 32× concurrency |
+| **Bit-reversed sequence as PK + tie-breaker** | The `id` column serves dual purpose: (1) distributes writes across Spanner splits (avoids hotspotting on monotonic auto-increment), and (2) acts as a **tie-breaker** — rows with identical commit timestamps remain distinct because each has a unique `id`. This matters because spanner-etcd's append-only log can produce multiple rows per timestamp from concurrent non-overlapping transactions. | Even write distribution; no duplicate-revision risk |
+| **Row-level locking for same-key safety** | Spanner serializes concurrent writes to the same key via row-level locks. Two transactions mutating the same key acquire conflicting locks, forcing sequential commits with **distinct** commit timestamps. Only non-overlapping writes (different keys) can share a timestamp — and those produce distinct rows by `id`. | No application-level dedup needed for same-key writes |
 | **Covering index with STORING** | Index-only reads — no table lookup for common Get queries | **+40% read improvement**, +167% mixed workload |
 | **Append-only log model** | Matches etcd's MVCC semantics — every write appends a new row, old rows cleaned by compaction | Preserves etcd wire compatibility at the cost of compaction complexity |
 | **Change Streams for watch** | Push-based delivery from Spanner's CDC; cursor persisted to DB every 5s for crash recovery | ~30ms watch latency (vs etcd's ~1ms) |
@@ -904,7 +905,7 @@ CREATE CHANGE STREAM ResourceChanges
 
 **No CompactionHorizon table:** Without an event log, there is nothing to compact. Change Streams manage their own retention automatically.
 
-> **Emulator limitation:** The [Spanner emulator does not support Change Streams](https://cloud.google.com/spanner/docs/emulator#limitations). For local dev and CI, the `ResourceStore` implementation should fall back to an `EventLog` table + polling. This is handled at the implementation level — the schema above is for production Spanner only. The PostgreSQL backend (used for local dev) already has its own event log + LISTEN/NOTIFY mechanism.
+> **Emulator support:** The [Spanner emulator supports Change Streams](https://github.com/GoogleCloudPlatform/cloud-spanner-emulator/releases/tag/v1.5.9) since v1.5.9 (August 2023). This means local dev and CI can use the same Change Streams-based watch path as production — no polling fallback needed.
 
 **Resource version strategy for Spanner:** Two options:
 
@@ -953,6 +954,14 @@ This eliminates the counter document entirely but requires converting timestamps
 | **Kine** | `BIGSERIAL` | Simple, sequential | Requires gap-free sequence; limits HA options |
 
 **Recommendation:** For PostgreSQL, use `pg_current_xact_id()` (proven by postgres-controller-backend). For Spanner, start with counter-based (simpler) and migrate to commit-timestamp if counter becomes a bottleneck under multi-replica concurrent writes. The migration path is straightforward — counter and commit-timestamp RVs are both monotonic INT64 values, so the `ResourceStore` interface doesn't change.
+
+**Gecko may not need a tie-breaker for commit-timestamp RVs.** spanner-etcd uses a `bit_reversed_positive` sequence column (`id`) as a tie-breaker because its append-only log model can produce multiple rows with the same commit timestamp from concurrent non-overlapping transactions. Gecko's architecture differs in two ways that make this unnecessary:
+
+1. **Update-in-place model.** Gecko writes one row per resource (no append-only log). Two concurrent writes to *different* resources may share a commit timestamp, but they are distinct rows by primary key `(ResourceType, ContextFilter, Namespace, Name)`. Two concurrent writes to the *same* resource are serialized by Spanner's row-level locks, guaranteeing distinct timestamps.
+
+2. **Change Stream-based watch.** Watch delivery uses Change Stream cursors, which track exact stream position independent of `ResourceVersion` values. A watcher never resumes via `WHERE resource_version > X` on the resources table — it resumes from its persisted Change Stream cursor. Two mutations sharing a commit timestamp are both delivered by the Change Stream regardless.
+
+Therefore, non-unique `ResourceVersion` values across different resources are harmless in Gecko's architecture. **Constraint:** if a future code path ever queries `WHERE resource_version > X` on the resources table for incremental event delivery (bypassing Change Streams), non-unique RVs could cause missed events. This pattern should be avoided or, if needed, would require adding a tie-breaker column.
 
 ### 9.2 Watch / Change Notification
 
