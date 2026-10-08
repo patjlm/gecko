@@ -56,7 +56,7 @@ func TestBuild_UsesClusterIDForNamespaceAndHostedClusterSpec(t *testing.T) {
 	require.Equal(t, "clusters-550e8400-e29b-41d4-a716-446655440000", nsMeta["name"])
 
 	var hc map[string]any
-	require.NoError(t, json.Unmarshal(manifests[3], &hc))
+	require.NoError(t, json.Unmarshal(manifests[4], &hc))
 	hcMeta := hc["metadata"].(map[string]any)
 	require.Equal(t, "my-cluster-safe", hcMeta["name"])
 	require.Equal(t, "clusters-550e8400-e29b-41d4-a716-446655440000", hcMeta["namespace"])
@@ -78,7 +78,7 @@ func TestBuild_HostedControlPlaneNamespaceWithinLimit(t *testing.T) {
 	require.NoError(t, err)
 
 	var job map[string]any
-	require.NoError(t, json.Unmarshal(manifests[4], &job))
+	require.NoError(t, json.Unmarshal(manifests[5], &job))
 	metadata := job["metadata"].(map[string]any)
 	require.Equal(t, "clusters-550e8400-e29b-41d4-a716-446655440000-seventeen-chars-o", metadata["namespace"])
 	require.Len(t, metadata["namespace"], 63)
@@ -91,11 +91,11 @@ func TestBuild_ReturnsManifests(t *testing.T) {
 	require.NotNil(t, manifests)
 }
 
-func TestBuild_FiveManifests(t *testing.T) {
+func TestBuild_SixManifests(t *testing.T) {
 	input := testInput()
 	manifests, err := manifest.Build(input)
 	require.NoError(t, err)
-	require.Len(t, manifests, 5, "expected 5 manifests: Namespace, ExternalSecret, Certificate, HostedCluster, Job")
+	require.Len(t, manifests, 6, "expected 6 manifests: Namespace, ExternalSecret, Certificate (api), Certificate (apps), HostedCluster, Job")
 }
 
 func TestBuild_ManifestKinds(t *testing.T) {
@@ -103,7 +103,7 @@ func TestBuild_ManifestKinds(t *testing.T) {
 	manifests, err := manifest.Build(input)
 	require.NoError(t, err)
 
-	expectedKinds := []string{"Namespace", "ExternalSecret", "Certificate", "HostedCluster", "Job"}
+	expectedKinds := []string{"Namespace", "ExternalSecret", "Certificate", "Certificate", "HostedCluster", "Job"}
 	for i, m := range manifests {
 		var obj map[string]any
 		require.NoError(t, json.Unmarshal(m, &obj))
@@ -118,9 +118,9 @@ func TestBuild_HostedClusterReleaseImage(t *testing.T) {
 	manifests, err := manifest.Build(input)
 	require.NoError(t, err)
 
-	// HostedCluster is at index 3.
+	// HostedCluster is at index 4.
 	var obj map[string]any
-	require.NoError(t, json.Unmarshal(manifests[3], &obj))
+	require.NoError(t, json.Unmarshal(manifests[4], &obj))
 
 	spec, ok := obj["spec"].(map[string]any)
 	require.True(t, ok, "HostedCluster missing spec")
@@ -135,7 +135,7 @@ func TestBuild_JobName(t *testing.T) {
 	require.NoError(t, err)
 
 	var obj map[string]any
-	require.NoError(t, json.Unmarshal(manifests[4], &obj))
+	require.NoError(t, json.Unmarshal(manifests[5], &obj))
 
 	meta, ok := obj["metadata"].(map[string]any)
 	require.True(t, ok, "Job missing metadata")
@@ -151,7 +151,7 @@ func TestBuild_CPOAnnotation(t *testing.T) {
 	require.NoError(t, err)
 
 	var obj map[string]any
-	require.NoError(t, json.Unmarshal(manifests[3], &obj))
+	require.NoError(t, json.Unmarshal(manifests[4], &obj))
 
 	meta := obj["metadata"].(map[string]any)
 	annotations := meta["annotations"].(map[string]any)
@@ -166,7 +166,7 @@ func TestBuild_NoCPOAnnotationWhenEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	var obj map[string]any
-	require.NoError(t, json.Unmarshal(manifests[3], &obj))
+	require.NoError(t, json.Unmarshal(manifests[4], &obj))
 
 	meta := obj["metadata"].(map[string]any)
 	annotations := meta["annotations"].(map[string]any)
@@ -182,7 +182,7 @@ func TestBuild_DefaultEndpointAccess(t *testing.T) {
 	require.NoError(t, err)
 
 	var obj map[string]any
-	require.NoError(t, json.Unmarshal(manifests[3], &obj))
+	require.NoError(t, json.Unmarshal(manifests[4], &obj))
 
 	spec := obj["spec"].(map[string]any)
 	platform := spec["platform"].(map[string]any)
@@ -213,7 +213,7 @@ func TestBuild_ResourceLabels(t *testing.T) {
 		require.NoError(t, err)
 
 		var obj map[string]any
-		require.NoError(t, json.Unmarshal(manifests[3], &obj))
+		require.NoError(t, json.Unmarshal(manifests[4], &obj))
 
 		spec := obj["spec"].(map[string]any)
 		platform := spec["platform"].(map[string]any)
@@ -239,7 +239,7 @@ func TestBuild_ResourceLabels(t *testing.T) {
 		require.NoError(t, err)
 
 		var obj map[string]any
-		require.NoError(t, json.Unmarshal(manifests[3], &obj))
+		require.NoError(t, json.Unmarshal(manifests[4], &obj))
 
 		spec := obj["spec"].(map[string]any)
 		platform := spec["platform"].(map[string]any)
@@ -266,7 +266,7 @@ func TestBuild_ResourceLabels(t *testing.T) {
 		require.NoError(t, err)
 
 		var obj map[string]any
-		require.NoError(t, json.Unmarshal(manifests[3], &obj))
+		require.NoError(t, json.Unmarshal(manifests[4], &obj))
 
 		spec := obj["spec"].(map[string]any)
 		platform := spec["platform"].(map[string]any)
@@ -347,4 +347,44 @@ func TestBuild_PullSecretStoreName(t *testing.T) {
 		storeRef := spec["secretStoreRef"].(map[string]any)
 		require.Equal(t, "gcp-secret-manager", storeRef["name"])
 	})
+}
+
+func TestBuild_AppsCertificate(t *testing.T) {
+	input := testInput()
+	manifests, err := manifest.Build(input)
+	require.NoError(t, err)
+
+	// apps Certificate is at index 3 (after Namespace, ExternalSecret, api Certificate).
+	var cert map[string]any
+	require.NoError(t, json.Unmarshal(manifests[3], &cert))
+	require.Equal(t, "Certificate", cert["kind"])
+
+	meta := cert["metadata"].(map[string]any)
+	require.Equal(t, "default-ingress-cert", meta["name"])
+
+	spec := cert["spec"].(map[string]any)
+	require.Equal(t, "default-ingress-cert", spec["secretName"])
+	dnsNames := spec["dnsNames"].([]any)
+	require.Len(t, dnsNames, 1)
+	require.Equal(t, "*.apps.in.my-cluster-safe-alice.example.com", dnsNames[0])
+	issuerRef := spec["issuerRef"].(map[string]any)
+	require.Equal(t, "public-issuer", issuerRef["name"])
+	require.Equal(t, "ClusterIssuer", issuerRef["kind"])
+}
+
+func TestBuild_IngressDefaultCertificateWiring(t *testing.T) {
+	input := testInput()
+	manifests, err := manifest.Build(input)
+	require.NoError(t, err)
+
+	// HostedCluster is at index 4.
+	var hc map[string]any
+	require.NoError(t, json.Unmarshal(manifests[4], &hc))
+
+	spec := hc["spec"].(map[string]any)
+	opCfg := spec["operatorConfiguration"].(map[string]any)
+	ingressOp := opCfg["ingressOperator"].(map[string]any)
+	defaultCert := ingressOp["defaultCertificate"].(map[string]any)
+	require.Equal(t, "default-ingress-cert", defaultCert["name"],
+		"ingress default certificate must reference the apps cert secret")
 }

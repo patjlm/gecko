@@ -572,9 +572,9 @@ func TestReconcile_EndpointAccessPropagated(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tr.ApplyCalls, 1)
 
-	// The HostedCluster manifest is the 4th manifest (index 3).
+	// The HostedCluster manifest is the 5th manifest (index 4), after the apps Certificate.
 	var obj map[string]any
-	require.NoError(t, json.Unmarshal(tr.ApplyCalls[0].Manifests[3], &obj))
+	require.NoError(t, json.Unmarshal(tr.ApplyCalls[0].Manifests[4], &obj))
 	spec := obj["spec"].(map[string]any)
 	platform := spec["platform"].(map[string]any)
 	gcp := platform["gcp"].(map[string]any)
@@ -612,7 +612,7 @@ func TestReconcile_UsesClusterUIDForHostedClusterIdentity(t *testing.T) {
 	require.Len(t, tr.ApplyCalls, 1)
 
 	var obj map[string]any
-	require.NoError(t, json.Unmarshal(tr.ApplyCalls[0].Manifests[3], &obj))
+	require.NoError(t, json.Unmarshal(tr.ApplyCalls[0].Manifests[4], &obj))
 	metadata := obj["metadata"].(map[string]any)
 	require.Equal(t, cluster.Spec.SafeName, metadata["name"])
 	require.Equal(t, "my-cluster-with-a", metadata["name"])

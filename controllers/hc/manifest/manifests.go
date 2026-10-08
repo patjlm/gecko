@@ -111,6 +111,10 @@ func buildManifests(input Input, clusterNS, hcNS string) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	appsCert, err := buildAppsCertificate(input, clusterNS)
+	if err != nil {
+		return nil, err
+	}
 	hc, err := buildHostedCluster(input, clusterNS)
 	if err != nil {
 		return nil, err
@@ -120,7 +124,7 @@ func buildManifests(input Input, clusterNS, hcNS string) ([][]byte, error) {
 		return nil, err
 	}
 
-	return [][]byte{ns, es, cert, hc, job}, nil
+	return [][]byte{ns, es, cert, appsCert, hc, job}, nil
 }
 
 func buildNamespace(input Input, clusterNS string) ([]byte, error) {
@@ -237,6 +241,56 @@ func buildCertificate(input Input, clusterNS string) ([]byte, error) {
 	return raw, nil
 }
 
+func buildAppsCertificate(input Input, clusterNS string) ([]byte, error) {
+	genStr := strconv.FormatInt(input.Generation, 10)
+	// Ingress wildcard. The HostedCluster's ingress base domain is the delegated
+	// in.<cluster>-<slug>.<baseDomain> subdomain (see buildHostedCluster dns), so
+	// the default ingress serving cert must cover *.apps under it.
+	dnsName := fmt.Sprintf("*.apps.in.%s-%s.%s", input.ClusterName, input.Slug, input.BaseDomain)
+	obj := map[string]any{
+		"apiVersion": "cert-manager.io/v1",
+		"kind":       "Certificate",
+		"metadata": map[string]any{
+			"name":      "default-ingress-cert",
+			"namespace": clusterNS,
+			"labels": map[string]any{
+				"gcp.managed.openshift.io/cluster-id":    input.ClusterID,
+				"gcp.managed.openshift.io/managed-by":    "hc-controller",
+				"gcp.managed.openshift.io/resource-type": "certificate",
+			},
+			"annotations": map[string]any{
+				"gcp.managed.openshift.io/generation": genStr,
+			},
+		},
+		"spec": map[string]any{
+			"subject": map[string]any{
+				"organizations": []any{"Red Hat - Hypershift"},
+			},
+			"usages":      []any{"server auth", "client auth"},
+			"duration":    "2160h",
+			"renewBefore": "720h",
+			"privateKey": map[string]any{
+				"algorithm":      "RSA",
+				"encoding":       "PKCS1",
+				"size":           2048,
+				"rotationPolicy": "Always",
+			},
+			"dnsNames":   []any{dnsName},
+			"secretName": "default-ingress-cert",
+			"issuerRef": map[string]any{
+				"name":  "public-issuer",
+				"kind":  "ClusterIssuer",
+				"group": "cert-manager.io",
+			},
+		},
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("hc manifest: marshal apps certificate: %w", err)
+	}
+	return raw, nil
+}
+
 func buildHostedCluster(input Input, clusterNS string) ([]byte, error) {
 	genStr := strconv.FormatInt(input.Generation, 10)
 	apiHostname := fmt.Sprintf("api.%s-%s.%s", input.ClusterName, input.Slug, input.BaseDomain)
@@ -333,6 +387,18 @@ func buildHostedCluster(input Input, clusterNS string) ([]byte, error) {
 					"ImageRegistry",
 					"Console",
 					"Ingress",
+				},
+			},
+			// Use the cert-manager-issued *.apps wildcard as the default ingress
+			// serving certificate. The HyperShift operator syncs this secret into
+			// the control-plane namespace and HCCO wires it onto the guest
+			// IngressController. Takes effect only when the Ingress capability is
+			// enabled (see capabilities.disabled above).
+			"operatorConfiguration": map[string]any{
+				"ingressOperator": map[string]any{
+					"defaultCertificate": map[string]any{
+						"name": "default-ingress-cert",
+					},
 				},
 			},
 			"configuration": map[string]any{
