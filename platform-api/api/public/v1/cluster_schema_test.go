@@ -68,6 +68,7 @@ func validCluster(version string) Cluster {
 							StorageEmail:         "storage@test-project.iam.gserviceaccount.com",
 							ImageRegistryEmail:   "image-registry@test-project.iam.gserviceaccount.com",
 							NetworkEmail:         "network@test-project.iam.gserviceaccount.com",
+							IngressEmail:         "ingress@test-project.iam.gserviceaccount.com",
 						},
 					},
 				},

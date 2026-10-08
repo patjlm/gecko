@@ -382,6 +382,22 @@ type ServiceAccountsRef struct {
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="networkEmail is immutable"
 	NetworkEmail string `json:"networkEmail,omitempty"`
+
+	// ingress is the Google Service Account email for the Ingress Operator
+	// that manages Cloud DNS records for the hosted cluster's `*.apps` wildcard domain.
+	// This GSA requires the following IAM roles:
+	// - roles/dns.admin (DNS Admin - for managing Cloud DNS records)
+	// See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
+	// Format: service-account-name@project-id.iam.gserviceaccount.com
+	//
+	// This is a user-provided value referencing a pre-created Google Service Account.
+	// Typically obtained from the output of `hypershift infra create gcp` which creates
+	// the required service accounts with appropriate IAM roles and WIF bindings.
+	//
+	// +orlop:public
+	// +required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="ingressEmail is immutable"
+	IngressEmail string `json:"ingressEmail,omitempty"`
 }
 
 // GCPResourceLabel is a label applied to GCP resources.

@@ -408,6 +408,22 @@ properties:
                         x-kubernetes-validations:
                         - message: imageRegistryEmail is immutable
                           rule: self == oldSelf
+                      ingressEmail:
+                        description: |-
+                          ingress is the Google Service Account email for the Ingress Operator
+                          that manages Cloud DNS records for the hosted cluster's `*.apps` wildcard domain.
+                          This GSA requires the following IAM roles:
+                          - roles/dns.admin (DNS Admin - for managing Cloud DNS records)
+                          See cmd/infra/gcp/iam-bindings.json for the authoritative role definitions.
+                          Format: service-account-name@project-id.iam.gserviceaccount.com
+
+                          This is a user-provided value referencing a pre-created Google Service Account.
+                          Typically obtained from the output of `hypershift infra create gcp` which creates
+                          the required service accounts with appropriate IAM roles and WIF bindings.
+                        type: string
+                        x-kubernetes-validations:
+                        - message: ingressEmail is immutable
+                          rule: self == oldSelf
                       networkEmail:
                         description: |-
                           network is the Google Service Account email for the Cloud Network Config Controller
@@ -466,6 +482,7 @@ properties:
                     - cloudControllerEmail
                     - controlPlaneEmail
                     - imageRegistryEmail
+                    - ingressEmail
                     - networkEmail
                     - nodePoolEmail
                     - storageEmail

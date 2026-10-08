@@ -30,6 +30,7 @@ type Input struct {
 	StorageEmail                 string
 	ImageRegistryEmail           string
 	NetworkEmail                 string
+	IngressEmail                 string
 	ReleaseImage                 string
 	ReleaseChannel               string
 	BaseDomain                   string
@@ -404,6 +405,7 @@ func buildGCPPlatform(input Input) map[string]any {
 				"storage":         input.StorageEmail,
 				"imageRegistry":   input.ImageRegistryEmail,
 				"network":         input.NetworkEmail,
+				"ingress":         input.IngressEmail,
 			},
 		},
 	}

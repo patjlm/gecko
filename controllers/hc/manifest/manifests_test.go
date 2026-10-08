@@ -32,6 +32,7 @@ func testInput() manifest.Input {
 		StorageEmail:                 "storage@project.iam.gserviceaccount.com",
 		ImageRegistryEmail:           "registry@project.iam.gserviceaccount.com",
 		NetworkEmail:                 "network@project.iam.gserviceaccount.com",
+		IngressEmail:                 "ingress@project.iam.gserviceaccount.com",
 		ReleaseImage:                 "quay.io/openshift-release-dev/ocp-release:4.15.0-x86_64",
 		ReleaseChannel:               "stable-4.15",
 		BaseDomain:                   "example.com",

@@ -130,7 +130,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	var gcpProjectID, gcpRegion, gcpNetwork, gcpSubnet, gcpEndpointAccess string
 	var wifProjectNumber, wifPoolID, wifProviderID string
 	var nodePoolEmail, controlPlaneEmail, cloudControllerEmail string
-	var storageEmail, imageRegistryEmail, networkEmail string
+	var storageEmail, imageRegistryEmail, networkEmail, ingressEmail string
 	if gcp := cluster.Spec.Platform.GCP; gcp != nil {
 		gcpProjectID = gcp.ProjectID
 		gcpRegion = gcp.Region
@@ -148,6 +148,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			storageEmail = sa.StorageEmail
 			imageRegistryEmail = sa.ImageRegistryEmail
 			networkEmail = sa.NetworkEmail
+			ingressEmail = sa.IngressEmail
 		}
 	}
 
@@ -174,6 +175,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		StorageEmail:         storageEmail,
 		ImageRegistryEmail:   imageRegistryEmail,
 		NetworkEmail:         networkEmail,
+		IngressEmail:         ingressEmail,
 		ReleaseImage:         vr.ReleaseImage,
 		ReleaseChannel:       vr.CincinnatiChannel,
 		BaseDomain:           placement.BaseDomain,
