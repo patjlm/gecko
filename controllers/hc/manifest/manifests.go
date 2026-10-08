@@ -382,18 +382,19 @@ func buildHostedCluster(input Input, clusterNS string) ([]byte, error) {
 					},
 				},
 			},
+			// Console and Ingress are enabled (run on the guest worker nodes, as
+			// for ROSA); only ImageRegistry stays disabled. The default ingress
+			// wildcard cert and the ingress-operator workload-identity service
+			// account below both require the Ingress capability to be enabled.
 			"capabilities": map[string]any{
 				"disabled": []any{
 					"ImageRegistry",
-					"Console",
-					"Ingress",
 				},
 			},
 			// Use the cert-manager-issued *.apps wildcard as the default ingress
 			// serving certificate. The HyperShift operator syncs this secret into
 			// the control-plane namespace and HCCO wires it onto the guest
-			// IngressController. Takes effect only when the Ingress capability is
-			// enabled (see capabilities.disabled above).
+			// IngressController.
 			"operatorConfiguration": map[string]any{
 				"ingressOperator": map[string]any{
 					"defaultCertificate": map[string]any{
